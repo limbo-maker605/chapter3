@@ -8,6 +8,8 @@ from torch.utils.data import DataLoader
 import cvxpy as cp
 from gurobipy import *
 import os
+import cplex
+
 os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
 
 # 展平操作
@@ -63,6 +65,20 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 model_dnn_2 = nn.Sequential(Flatten(), nn.Linear(784,200), nn.ReLU(),
                             nn.Linear(200,10)).to(device)
+
+model_dnn_4 = nn.Sequential(Flatten(), nn.Linear(784,200), nn.ReLU(),
+                            nn.Linear(200,100), nn.ReLU(),
+                            nn.Linear(100,100), nn.ReLU(),
+                            nn.Linear(100,10)).to(device)
+
+model_cnn = nn.Sequential(nn.Conv2d(1, 8, 3, padding=1), nn.ReLU(),
+                          nn.Conv2d(8, 8, 3, padding=1, stride=2), nn.ReLU(),
+                          nn.Conv2d(8, 16, 3, padding=1), nn.ReLU(),
+                          nn.Conv2d(16, 16, 3, padding=1, stride=2), nn.ReLU(),
+                          Flatten(),
+                          nn.Linear(7*7*16, 100), nn.ReLU(),
+                          nn.Linear(100, 10)).to(device)
+#
 
 for X, y in test_loader:
     X, y = X.to(device), y.to(device)
@@ -137,38 +153,72 @@ def epoch(loader, model, opt=None):
     return total_err / len(loader.dataset), total_loss / len(loader.dataset)
 
 # train dnn_2
-opt = optim.SGD(model_dnn_2.parameters(), lr=1e-1)
-for _ in range(10):
-    train_err, train_loss = epoch(train_loader, model_dnn_2, opt)
-    test_err, test_loss = epoch(test_loader, model_dnn_2)
-    # print(*("{:.6f}".format(i) for i in (train_err, train_loss, test_err, test_loss)), sep="\t")
-torch.save(model_dnn_2.state_dict(), "model_dnn_2.pt")
+# opt = optim.SGD(model_dnn_2.parameters(), lr=1e-1)
+# for _ in range(10):
+#     train_err, train_loss = epoch(train_loader, model_dnn_2, opt)
+#     test_err, test_loss = epoch(test_loader, model_dnn_2)
+#     print(*("{:.6f}".format(i) for i in (train_err, train_loss, test_err, test_loss)), sep="\t")
+# torch.save(model_dnn_2.state_dict(), "model_dnn_2.pt")
 model_dnn_2.load_state_dict(torch.load("model_dnn_2.pt"))
 
+# train dnn_4
+# opt = optim.SGD(model_dnn_4.parameters(), lr=1e-1)
+# for _ in range(10):
+#     train_err, train_loss = epoch(train_loader, model_dnn_4, opt)
+#     test_err, test_loss = epoch(test_loader, model_dnn_4)
+#     print(*("{:.6f}".format(i) for i in (train_err, train_loss, test_err, test_loss)), sep="\t")
+# torch.save(model_dnn_4.state_dict(), "model_dnn_4.pt")
+model_dnn_4.load_state_dict(torch.load("model_dnn_4.pt"))
+
+# train cnn
+opt = optim.SGD(model_cnn.parameters(), lr=1e-1)
+for t in range(10):
+    train_err, train_loss = epoch(train_loader, model_cnn, opt)
+    test_err, test_loss = epoch(test_loader, model_cnn)
+    if t == 4:
+        for param_group in opt.param_groups:
+            param_group["lr"] = 1e-2
+    print(*("{:.6f}".format(i) for i in (train_err, train_loss, test_err, test_loss)), sep="\t")
+torch.save(model_cnn.state_dict(), "model_cnn.pt")
+# 加载cnn model'
+model_cnn.load_state_dict(torch.load("model_cnn.pt"))
 
 # train small model and save to disk
-opt = optim.SGD(model_small.parameters(), lr=1e-1)
-for _ in range(10):
-    train_err, train_loss = epoch(train_loader, model_small, opt)
-    test_err, test_loss = epoch(test_loader, model_small)
-    # print(*("{:.6f}".format(i) for i in (train_err, train_loss, test_err, test_loss)), sep="\t")
-torch.save(model_small.state_dict(), "model_small.pt")
+# opt = optim.SGD(model_small.parameters(), lr=1e-1)
+# for _ in range(10):
+#     train_err, train_loss = epoch(train_loader, model_small, opt)
+#     test_err, test_loss = epoch(test_loader, model_small)
+#     # print(*("{:.6f}".format(i) for i in (train_err, train_loss, test_err, test_loss)), sep="\t")
+# torch.save(model_small.state_dict(), "model_small.pt")
 
 # load model from disk
 model_small.load_state_dict(torch.load("model_small.pt"))
-
+#
 epsilon = 0.1
 initial_bound = ((X[0:1] - epsilon).clamp(min=0), (X[0:1] + epsilon).clamp(max=1))
-bounds = bound_propagation(model_small, initial_bound)
+# 计算cnn 边界
+bounds = bound_propagation(model_cnn, initial_bound)
 c = np.zeros(10)
 c[y[0].item()] = 1
 c[2] = -1
-# #使用gurobi去计算，负数说明存在对抗样本
-prob, (z, v) = form_milp(model_small, c, initial_bound, bounds)
+# 使用gurobi去计算，负数说明存在对抗样本
+prob, (z, v) = form_milp(model_cnn, c, initial_bound, bounds)
 prob.solve(solver=cp.GUROBI, verbose=True)
 
-print("Last layer values from MILP:", z[3].value)
-print("Last layer from model:",
-      model_small(torch.tensor(z[0].value).float().view(1,1,28,28).to(device))[0].detach().cpu().numpy())
-plt.imshow(1-z[0].value.reshape(28,28), cmap="gray")
-plt.show()
+
+# print(prob.value)
+# print("Last layer values from MILP:", z[2].value)
+# print("Last layer from model:",
+#       model_dnn_2(torch.tensor(z[0].value).float().view(1,1,28,28).to(device))[0].detach().cpu().numpy())
+# plt.imshow(1-z[0].value.reshape(28,28), cmap="gray")
+# plt.show()
+
+# epsilon = 0.1
+# initial_bound = ((X[0:1] - epsilon).clamp(min=0), (X[0:1] + epsilon).clamp(max=1))
+# bounds = bound_propagation(model_dnn_2, initial_bound)
+
+# for y_targ in range(10):
+#     if y_targ != y[0].item():
+#         c = np.eye(10)[y[0].item()] - np.eye(10)[y_targ]
+#         prob, _ = form_milp(model_dnn_2, c, initial_bound, bounds)
+#         print("Targeted attack {} objective: {}".format(y_targ, prob.solve(solver=cp.GUROBI)))
