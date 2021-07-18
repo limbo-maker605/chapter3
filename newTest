@@ -1,0 +1,224 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import pylab as plt
+import numpy as np
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
+import cvxpy as cp
+from gurobipy import *
+import os
+import cplex
+
+os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
+
+# 展平操作
+class Flatten(nn.Module):
+    def forward(self, x):
+        return x.view(x.shape[0], -1)
+
+def bound_propagation(model, initial_bound):
+    l, u = initial_bound
+    bounds = []
+
+    for layer in model:
+        if isinstance(layer, Flatten):
+            l_ = Flatten()(l)
+            u_ = Flatten()(u)
+
+        elif isinstance(layer, nn.Linear):
+            l_ = (layer.weight.clamp(min=0) @ l.t() + layer.weight.clamp(max=0) @ u.t()
+                  + layer.bias[:, None]).t()
+            u_ = (layer.weight.clamp(min=0) @ u.t() + layer.weight.clamp(max=0) @ l.t()
+                  + layer.bias[:, None]).t()
+        elif isinstance(layer, nn.Conv2d):
+            l_ = (nn.functional.conv2d(l, layer.weight.clamp(min=0), bias=None,
+                                       stride=layer.stride, padding=layer.padding,
+                                       dilation=layer.dilation, groups=layer.groups) +
+                  nn.functional.conv2d(u, layer.weight.clamp(max=0), bias=None,
+                                       stride=layer.stride, padding=layer.padding,
+                                       dilation=layer.dilation, groups=layer.groups) +
+                  layer.bias[None, :, None, None])
+
+            u_ = (nn.functional.conv2d(u, layer.weight.clamp(min=0), bias=None,
+                                       stride=layer.stride, padding=layer.padding,
+                                       dilation=layer.dilation, groups=layer.groups) +
+                  nn.functional.conv2d(l, layer.weight.clamp(max=0), bias=None,
+                                       stride=layer.stride, padding=layer.padding,
+                                       dilation=layer.dilation, groups=layer.groups) +
+                  layer.bias[None, :, None, None])
+
+        elif isinstance(layer, nn.ReLU):
+            l_ = l.clamp(min=0)
+            u_ = u.clamp(min=0)
+
+        bounds.append((l_, u_))
+        l, u = l_, u_
+    return bounds
+
+mnist_train = datasets.MNIST("../data", train=True, download=True, transform=transforms.ToTensor())
+mnist_test = datasets.MNIST("../data", train=False, download=True, transform=transforms.ToTensor())
+train_loader = DataLoader(mnist_train, batch_size = 100, shuffle=True)
+test_loader = DataLoader(mnist_test, batch_size = 100, shuffle=False)
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+model_dnn_2 = nn.Sequential(Flatten(), nn.Linear(784,200), nn.ReLU(),
+                            nn.Linear(200,10)).to(device)
+
+model_dnn_4 = nn.Sequential(Flatten(), nn.Linear(784,200), nn.ReLU(),
+                            nn.Linear(200,100), nn.ReLU(),
+                            nn.Linear(100,100), nn.ReLU(),
+                            nn.Linear(100,10)).to(device)
+
+model_cnn = nn.Sequential(nn.Conv2d(1, 8, 3, padding=1), nn.ReLU(),
+                          nn.Conv2d(8, 8, 3, padding=1, stride=2), nn.ReLU(),
+                          nn.Conv2d(8, 16, 3, padding=1), nn.ReLU(),
+                          nn.Conv2d(16, 16, 3, padding=1, stride=2), nn.ReLU(),
+                          Flatten(),
+                          nn.Linear(7*7*16, 100), nn.ReLU(),
+                          nn.Linear(100, 10)).to(device)
+#
+
+for X, y in test_loader:
+    X, y = X.to(device), y.to(device)
+    break
+
+def plot_images(X, y, yp, M, N):
+    f, ax = plt.subplots(M, N, sharex=True, sharey=True, figsize=(N, M * 1.3))
+    for i in range(M):
+        for j in range(N):
+            ax[i][j].imshow(1 - X[i * N + j][0].cpu().numpy(), cmap="gray")
+            title = ax[i][j].set_title("Pred: {}".format(yp[i * N + j].max(dim=0)[1]))
+            plt.setp(title, color=('g' if yp[i * N + j].max(dim=0)[1] == y[i * N + j] else 'r'))
+            ax[i][j].set_axis_off()
+    plt.tight_layout()
+    plt.show()
+
+def form_milp(model, c, initial_bounds, bounds):
+    linear_layers = [(layer, bound) for layer, bound in zip(model, bounds) if isinstance(layer, nn.Linear)]
+    d = len(linear_layers) - 1
+
+    # create cvxpy variables
+    z = ([cp.Variable(layer.in_features) for layer, _ in linear_layers] +
+         [cp.Variable(linear_layers[-1][0].out_features)])
+    v = [cp.Variable(layer.out_features, boolean=True) for layer, _ in linear_layers[:-1]]
+
+    # extract relevant matrices
+    W = [layer.weight.detach().cpu().numpy() for layer, _ in linear_layers]
+    b = [layer.bias.detach().cpu().numpy() for layer, _ in linear_layers]
+    l = [l[0].detach().cpu().numpy() for _, (l, _) in linear_layers]
+    u = [u[0].detach().cpu().numpy() for _, (_, u) in linear_layers]
+    l0 = initial_bounds[0][0].view(-1).detach().cpu().numpy()
+    u0 = initial_bounds[1][0].view(-1).detach().cpu().numpy()
+
+    # add ReLU constraints
+    constraints = []
+    for i in range(len(linear_layers) - 1):
+        constraints += [z[i + 1] >= W[i] @ z[i] + b[i],
+                        z[i + 1] >= 0,
+                        cp.multiply(v[i], u[i]) >= z[i + 1],
+                        W[i] @ z[i] + b[i] >= z[i + 1] + cp.multiply((1 - v[i]), l[i])]
+
+    # final linear constraint
+    constraints += [z[d + 1] == W[d] @ z[d] + b[d]]
+
+    # initial bound constraints
+    constraints += [z[0] >= l0, z[0] <= u0]
+
+    return cp.Problem(cp.Minimize(c @ z[d + 1]), constraints), (z, v)
+
+
+# 创建小神经网络
+model_small = nn.Sequential(Flatten(), nn.Linear(784,50), nn.ReLU(),
+                            nn.Linear(50,20), nn.ReLU(),
+                            nn.Linear(20,10)).to(device)
+
+def epoch(loader, model, opt=None):
+    total_loss, total_err = 0., 0.
+    for X, y in loader:
+        X, y = X.to(device), y.to(device)
+        yp = model(X)
+        loss = nn.CrossEntropyLoss()(yp, y)
+        if opt:
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+        total_err += (yp.max(dim=1)[1] != y).sum().item()
+        # print("err:",total_err)
+        total_loss += loss.item() * X.shape[0]
+        # print("shape",X.shape[0])
+        # print("loss",total_loss)
+    return total_err / len(loader.dataset), total_loss / len(loader.dataset)
+
+# train dnn_2
+# opt = optim.SGD(model_dnn_2.parameters(), lr=1e-1)
+# for _ in range(10):
+#     train_err, train_loss = epoch(train_loader, model_dnn_2, opt)
+#     test_err, test_loss = epoch(test_loader, model_dnn_2)
+#     print(*("{:.6f}".format(i) for i in (train_err, train_loss, test_err, test_loss)), sep="\t")
+# torch.save(model_dnn_2.state_dict(), "model_dnn_2.pt")
+model_dnn_2.load_state_dict(torch.load("model_dnn_2.pt"))
+
+# train dnn_4
+# opt = optim.SGD(model_dnn_4.parameters(), lr=1e-1)
+# for _ in range(10):
+#     train_err, train_loss = epoch(train_loader, model_dnn_4, opt)
+#     test_err, test_loss = epoch(test_loader, model_dnn_4)
+#     print(*("{:.6f}".format(i) for i in (train_err, train_loss, test_err, test_loss)), sep="\t")
+# torch.save(model_dnn_4.state_dict(), "model_dnn_4.pt")
+model_dnn_4.load_state_dict(torch.load("model_dnn_4.pt"))
+
+# train cnn
+opt = optim.SGD(model_cnn.parameters(), lr=1e-1)
+for t in range(10):
+    train_err, train_loss = epoch(train_loader, model_cnn, opt)
+    test_err, test_loss = epoch(test_loader, model_cnn)
+    if t == 4:
+        for param_group in opt.param_groups:
+            param_group["lr"] = 1e-2
+    print(*("{:.6f}".format(i) for i in (train_err, train_loss, test_err, test_loss)), sep="\t")
+torch.save(model_cnn.state_dict(), "model_cnn.pt")
+# 加载cnn model'
+model_cnn.load_state_dict(torch.load("model_cnn.pt"))
+
+# train small model and save to disk
+# opt = optim.SGD(model_small.parameters(), lr=1e-1)
+# for _ in range(10):
+#     train_err, train_loss = epoch(train_loader, model_small, opt)
+#     test_err, test_loss = epoch(test_loader, model_small)
+#     # print(*("{:.6f}".format(i) for i in (train_err, train_loss, test_err, test_loss)), sep="\t")
+# torch.save(model_small.state_dict(), "model_small.pt")
+
+# load model from disk
+model_small.load_state_dict(torch.load("model_small.pt"))
+#
+epsilon = 0.1
+initial_bound = ((X[0:1] - epsilon).clamp(min=0), (X[0:1] + epsilon).clamp(max=1))
+# 计算cnn 边界
+bounds = bound_propagation(model_cnn, initial_bound)
+c = np.zeros(10)
+c[y[0].item()] = 1
+c[2] = -1
+# 使用gurobi去计算，负数说明存在对抗样本
+prob, (z, v) = form_milp(model_cnn, c, initial_bound, bounds)
+prob.solve(solver=cp.GUROBI, verbose=True)
+
+
+# print(prob.value)
+# print("Last layer values from MILP:", z[2].value)
+# print("Last layer from model:",
+#       model_dnn_2(torch.tensor(z[0].value).float().view(1,1,28,28).to(device))[0].detach().cpu().numpy())
+# plt.imshow(1-z[0].value.reshape(28,28), cmap="gray")
+# plt.show()
+
+# epsilon = 0.1
+# initial_bound = ((X[0:1] - epsilon).clamp(min=0), (X[0:1] + epsilon).clamp(max=1))
+# bounds = bound_propagation(model_dnn_2, initial_bound)
+
+# for y_targ in range(10):
+#     if y_targ != y[0].item():
+#         c = np.eye(10)[y[0].item()] - np.eye(10)[y_targ]
+#         prob, _ = form_milp(model_dnn_2, c, initial_bound, bounds)
+#         print("Targeted attack {} objective: {}".format(y_targ, prob.solve(solver=cp.GUROBI)))
