@@ -9,6 +9,8 @@ import cvxpy as cp
 from gurobipy import *
 import os
 import cplex
+from torch.autograd import Variable
+import gurobipy as grb
 
 os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
 
@@ -97,6 +99,77 @@ def plot_images(X, y, yp, M, N):
 
 def form_milp(model, c, initial_bounds, bounds):
     linear_layers = [(layer, bound) for layer, bound in zip(model, bounds) if isinstance(layer, nn.Linear)]
+    convolution_layers = [(layer, bound) for layer, bound in zip(model, bounds) if isinstance(layer, nn.Conv2d)]
+    d = len(linear_layers) - 1
+    d2 = len(convolution_layers) - 1
+    # create cvxpy variables
+    z = ([cp.Variable(layer.in_features) for layer, _ in linear_layers] +
+         [cp.Variable(linear_layers[-1][0].out_features)])
+    v = [cp.Variable(layer.out_features, boolean=True) for layer, _ in linear_layers[:-1]]
+
+    # extract relevant matrices
+    W = [layer.weight.detach().cpu().numpy() for layer, _ in linear_layers]
+    b = [layer.bias.detach().cpu().numpy() for layer, _ in linear_layers]
+    l = [l[0].detach().cpu().numpy() for _, (l, _) in linear_layers]
+    u = [u[0].detach().cpu().numpy() for _, (_, u) in linear_layers]
+    l0 = initial_bounds[0][0].view(-1).detach().cpu().numpy()
+    u0 = initial_bounds[1][0].view(-1).detach().cpu().numpy()
+
+    # # create cvxpy variables
+    # z2 = ([cp.Variable(layer.in_channels) for layer, _ in convolution_layers] +
+    #      [cp.Variable(convolution_layers[-1][0].out_channels)])
+    # z2_total = ([cp.Variable(layer.in_channels*3*3) for layer, _ in convolution_layers] +
+    #      [cp.Variable(convolution_layers[-1][0].out_channels*3*3)])
+    # v2 = [cp.Variable(layer.out_channels, boolean=True) for layer, _ in convolution_layers[:-1]]
+    # # extract relevant matrices
+    # W2 = [layer.weight.detach().cpu().numpy() for layer, _ in convolution_layers]
+    # b2 = [layer.bias.detach().cpu().numpy() for layer, _ in convolution_layers]
+    # l2 = [l2[0].detach().cpu().numpy() for _, (l2, _) in convolution_layers]
+    # u2 = [u2[0].detach().cpu().numpy() for _, (_, u2) in convolution_layers]
+    # l02 = initial_bounds[0][0].view(-1).detach().cpu().numpy()
+    # u02 = initial_bounds[1][0].view(-1).detach().cpu().numpy()
+    # #
+    # # add ReLU constraints
+    # len_inchannels = [layer.in_channels*3*3 for layer, _ in convolution_layers] + [convolution_layers[-1][0].out_channels*3*3]
+    # len_outchannels = [layer.out_channels for layer, _ in convolution_layers]
+    # stride_list = [layer.stride for layer, _ in convolution_layers]
+    # s = []
+    # for i in range(len(len_outchannels)):
+    #     s += list(stride_list[i])
+    # num = [x * x for x in s][::2]
+    constraints = []
+    # count = 784
+    # for i in range(len(convolution_layers) - 1):
+    #     count = int(count/num[i])
+    #     upper = np.reshape(u2[i], (len_outchannels[i], count))
+    #     low = np.reshape(l2[i], (len_outchannels[i], count))
+    #     constraints += [z2[i + 1] >= np.reshape(W2[i],(len_outchannels[i],len_inchannels[i])) @ z2_total[i] + b2[i],
+    #                     z2[i + 1] >= 0,
+    #                     cp.multiply(v2[i], upper.mean()) >= z2[i + 1],
+    #                     np.reshape(W2[i],(len_outchannels[i],len_inchannels[i])) @ z2_total[i] + b2[i] >= z2[i + 1] + cp.multiply((1 - v2[i]), low.mean())]
+    #
+    #     # final linear constraint
+    # constraints += [z2[d2 + 1] == np.reshape(W2[d2],(len_outchannels[d2],len_inchannels[d2])) @ z2_total[d2] + b2[d2]]
+    # # initial bound constraints
+    # constraints += [z2[0] >= l02, z2[0] <= u02]
+
+    # add ReLU constraints
+    for i in range(len(linear_layers) - 1):
+        constraints += [z[i + 1] >= W[i] @ z[i] + b[i],
+                        z[i + 1] >= 0,
+                        cp.multiply(v[i], u[i]) >= z[i + 1],
+                        W[i] @ z[i] + b[i] >= z[i + 1] + cp.multiply((1 - v[i]), l[i])]
+
+    # final linear constraint
+    constraints += [z[d + 1] == W[d] @ z[d] + b[d]]
+
+    # initial bound constraints
+    constraints += [z[0] >= l0, z[0] <= u0]
+    return cp.Problem(cp.Minimize(c @ z[d + 1]), constraints), (z, v)
+
+
+def form_milp2(model, c, initial_bounds, bounds):
+    linear_layers = [(layer, bound) for layer, bound in zip(model, bounds) if isinstance(layer, nn.Linear)]
     d = len(linear_layers) - 1
 
     # create cvxpy variables
@@ -171,14 +244,14 @@ model_dnn_2.load_state_dict(torch.load("model_dnn_2.pt"))
 model_dnn_4.load_state_dict(torch.load("model_dnn_4.pt"))
 
 # train cnn
-opt = optim.SGD(model_cnn.parameters(), lr=1e-1)
-for t in range(10):
-    train_err, train_loss = epoch(train_loader, model_cnn, opt)
-    test_err, test_loss = epoch(test_loader, model_cnn)
-    if t == 4:
-        for param_group in opt.param_groups:
-            param_group["lr"] = 1e-2
-    print(*("{:.6f}".format(i) for i in (train_err, train_loss, test_err, test_loss)), sep="\t")
+# opt = optim.SGD(model_cnn.parameters(), lr=1e-1)
+# for t in range(10):
+#     train_err, train_loss = epoch(train_loader, model_cnn, opt)
+#     test_err, test_loss = epoch(test_loader, model_cnn)
+#     if t == 4:
+#         for param_group in opt.param_groups:
+#             param_group["lr"] = 1e-2
+    # print(*("{:.6f}".format(i) for i in (train_err, train_loss, test_err, test_loss)), sep="\t")
 torch.save(model_cnn.state_dict(), "model_cnn.pt")
 # 加载cnn model'
 model_cnn.load_state_dict(torch.load("model_cnn.pt"))
@@ -193,23 +266,214 @@ model_cnn.load_state_dict(torch.load("model_cnn.pt"))
 
 # load model from disk
 model_small.load_state_dict(torch.load("model_small.pt"))
-#
+
+def linear_approximation(model, bounds):
+    lower_bounds = []
+    upper_bounds = []
+    gurobi_vars = []
+
+    gurobi_model = grb.Model()
+    gurobi_model.setParam('OutputFlag', False)
+    gurobi_model.setParam('Threads', 1)
+
+    # input layer
+    inp_lb = []
+    inp_ub = []
+    inp_gurobi_vars = []
+
+    # 找到input layer的上下界
+    l1 = bounds[0][0][0].view(784, 1)
+    u1 = bounds[0][1][0].view(784, 1)
+    l2 = bounds[1][0][0].view(50, 1)
+    u2 = bounds[1][1][0].view(50, 1)
+
+    input_domain1 = torch.cat((l1, l2), dim=0)
+    input_domain2 = torch.cat((u1, u2), dim=0)
+    input_domain = torch.cat((input_domain1, input_domain2), dim=1)
+    print(input_domain)
+    for dim, (lb, ub) in enumerate(input_domain):
+        v = gurobi_model.addVar(lb=lb, ub=ub, obj=0,
+                              vtype=grb.GRB.CONTINUOUS,
+                              name=f'inp_{dim}')
+        inp_gurobi_vars.append(v)
+        inp_lb.append(lb)
+        inp_ub.append(ub)
+    gurobi_model.update()
+    lower_bounds.append(inp_lb)
+    upper_bounds.append(inp_ub)
+    gurobi_vars.append(inp_gurobi_vars)
+    # print("lower_bounds",lower_bounds)
+    # print("upper_bounds",upper_bounds)
+    # print("gurobi_vars", gurobi_vars)
+    #other layers
+    layer_idx = 1
+    layers = [layer for layer in model]
+    for layer in layers:
+        new_layer_lb = []
+        new_layer_ub = []
+        new_layer_gurobi_vars = []
+        if type(layer) is nn.Linear:
+            a = []
+            for neuron_idx in range(layer.weight.size(0)):
+                ub = layer.bias.data[neuron_idx]
+                lb = layer.bias.data[neuron_idx]
+                lin_expr = layer.bias.data[neuron_idx]
+                for prev_neuron_idx in range(layer.weight.size(1)):
+                    coeff = layer.weight.data[neuron_idx, prev_neuron_idx]
+                    if coeff >= 0:
+                        ub += coeff * upper_bounds[-1][prev_neuron_idx]
+                        lb += coeff * lower_bounds[-1][prev_neuron_idx]
+                    else:
+                        ub += coeff * lower_bounds[-1][prev_neuron_idx]
+                        lb += coeff * upper_bounds[-1][prev_neuron_idx]
+                    lin_expr = coeff * gurobi_vars[-1][prev_neuron_idx] + lin_expr
+                    # print(lin_expr)
+                v = gurobi_model.addVar(lb=lb, ub=ub, obj=0,
+                                      vtype=grb.GRB.CONTINUOUS,
+                                      name=f'lay{layer_idx}_{neuron_idx}')
+                # a.append(v)
+
+                gurobi_model.addConstr(v == lin_expr)
+                # print("v",v)
+                # print("lin",lin_expr)
+                gurobi_model.update()
+                # print("这是a", a)
+                # print("这是v", v)
+                gurobi_model.setObjective(v, grb.GRB.MINIMIZE)
+                gurobi_model.optimize()
+
+                print("gurobi_model.status", gurobi_model.status)
+                print(v)
+                print(v.X)
+                assert gurobi_model.status == 2, "LP wasn't optimally solved"
+                # We have computed a lower bound
+                lb = v.X
+                v.lb = lb
+
+                # Let's now compute an upper bound
+                gurobi_model.setObjective(v, grb.GRB.MAXIMIZE)
+                gurobi_model.update()
+                gurobi_model.reset()
+                gurobi_model.optimize()
+                # print("gurobi_model.status", gurobi_model.status)
+                # 说明infeasible
+                assert gurobi_model.status == 2, "LP wasn't optimally solved"
+                ub = v.X
+                v.ub = ub
+                # print("lb", lb)
+                # print("ub", ub)
+                new_layer_lb.append(lb)
+                new_layer_ub.append(ub)
+                new_layer_gurobi_vars.append(v)
+        elif type(layer) == nn.ReLU:
+            for neuron_idx, pre_var in enumerate(gurobi_vars[-1]):
+                pre_lb = lower_bounds[-1][neuron_idx]
+                pre_ub = upper_bounds[-1][neuron_idx]
+
+                v = gurobi_model.addVar(lb=max(0, pre_lb),
+                                      ub=max(0, pre_ub),
+                                      obj=0,
+                                      vtype=grb.GRB.CONTINUOUS,
+                                      name=f'ReLU{layer_idx}_{neuron_idx}')
+                if pre_lb >= 0 and pre_ub >= 0:
+                    # The ReLU is always passing
+                    gurobi_model.addConstr(v == pre_var)
+                    lb = pre_lb
+                    ub = pre_ub
+                elif pre_lb <= 0 and pre_ub <= 0:
+                    lb = 0
+                    ub = 0
+                    # No need to add an additional constraint that v==0
+                    # because this will be covered by the bounds we set on
+                    # the value of v.
+                else:
+                    lb = 0
+                    ub = pre_ub
+                    gurobi_model.addConstr(v >= pre_var)
+
+                    slope = pre_ub / (pre_ub - pre_lb)
+                    bias = - pre_lb * slope
+                    gurobi_model.addConstr(v <= slope * pre_var + bias)
+
+                new_layer_lb.append(lb)
+                new_layer_ub.append(ub)
+                new_layer_gurobi_vars.append(v)
+        elif type(layer) == nn.MaxPool1d:
+            assert layer.padding == 0, "Non supported Maxpool option"
+            assert layer.dilation == 1, "Non supported MaxPool option"
+            nb_pre = len(gurobi_vars[-1])
+            window_size = layer.kernel_size
+            stride = layer.stride
+
+            pre_start_idx = 0
+            pre_window_end = pre_start_idx + window_size
+
+            while pre_window_end <= nb_pre:
+                lb = max(lower_bounds[-1][pre_start_idx:pre_window_end])
+                ub = max(upper_bounds[-1][pre_start_idx:pre_window_end])
+
+                neuron_idx = pre_start_idx // stride
+
+                v = model.addVar(lb=lb, ub=ub, obj=0, vtype=grb.GRB.CONTINUOUS,
+                                      name=f'Maxpool{layer_idx}_{neuron_idx}')
+                all_pre_var = 0
+                for pre_var in gurobi_vars[-1][pre_start_idx:pre_window_end]:
+                    model.addConstr(v >= pre_var)
+                    all_pre_var += pre_var
+                all_lb = sum(lower_bounds[-1][pre_start_idx:pre_window_end])
+                max_pre_lb = lb
+                gurobi_model.addConstr(all_pre_var >= v + all_lb - max_pre_lb)
+
+                pre_start_idx += stride
+                pre_window_end = pre_start_idx + window_size
+
+                new_layer_lb.append(lb)
+                new_layer_ub.append(ub)
+                new_layer_gurobi_vars.append(v)
+        elif type(layer) == Flatten:
+            continue
+        else:
+            raise NotImplementedError
+
+        lower_bounds.append(new_layer_lb)
+        upper_bounds.append(new_layer_ub)
+        gurobi_vars.append(new_layer_gurobi_vars)
+
+        layer_idx += 1
+
+        # Assert that this is as expected a network with a single output
+    assert len(gurobi_vars[-1]) == 1, "Network doesn't have scalar output"
+    gurobi_model.update()
+
+
+
+
 epsilon = 0.1
 initial_bound = ((X[0:1] - epsilon).clamp(min=0), (X[0:1] + epsilon).clamp(max=1))
-# 计算cnn 边界
-bounds = bound_propagation(model_cnn, initial_bound)
-c = np.zeros(10)
-c[y[0].item()] = 1
-c[2] = -1
+# # 计算cnn 边界
+bounds = bound_propagation(model_small, initial_bound)
+# c = np.zeros(10)
+# c[y[0].item()] = 1
+# c[2] = -1
 # 使用gurobi去计算，负数说明存在对抗样本
-prob, (z, v) = form_milp(model_cnn, c, initial_bound, bounds)
-prob.solve(solver=cp.GUROBI, verbose=True)
+linear_approximation(model_small, bounds)
+# prob, (z, v) = form_milp2(model_small, c, initial_bound, bounds)
+# prob.solve(solver=cp.GUROBI, verbose=True)
 
+
+
+
+# for dim, (lb, ub) in enumerate(input_domain):
+#     print(dim)
+#     print(lb)
+#     print(ub)
+# input_domain = torch.cat(bounds[0][0][0],bounds[0][1][0])
+# print(bounds[0])
 
 # print(prob.value)
-# print("Last layer values from MILP:", z[2].value)
+# print("Last layer values from MILP:", z[3].value)
 # print("Last layer from model:",
-#       model_dnn_2(torch.tensor(z[0].value).float().view(1,1,28,28).to(device))[0].detach().cpu().numpy())
+#       model_small(torch.tensor(z[0].value).float().view(1,1,28,28).to(device))[0].detach().cpu().numpy())
 # plt.imshow(1-z[0].value.reshape(28,28), cmap="gray")
 # plt.show()
 
@@ -220,5 +484,5 @@ prob.solve(solver=cp.GUROBI, verbose=True)
 # for y_targ in range(10):
 #     if y_targ != y[0].item():
 #         c = np.eye(10)[y[0].item()] - np.eye(10)[y_targ]
-#         prob, _ = form_milp(model_dnn_2, c, initial_bound, bounds)
+#         prob, _ = form_milp(model_cnn, c, initial_bound, bounds)
 #         print("Targeted attack {} objective: {}".format(y_targ, prob.solve(solver=cp.GUROBI)))
