@@ -268,6 +268,7 @@ model_cnn.load_state_dict(torch.load("model_cnn.pt"))
 model_small.load_state_dict(torch.load("model_small.pt"))
 
 def linear_approximation(model, bounds):
+    new_bounds = []
     lower_bounds = []
     upper_bounds = []
     gurobi_vars = []
@@ -284,13 +285,21 @@ def linear_approximation(model, bounds):
     # 找到input layer的上下界
     l1 = bounds[0][0][0].view(784, 1)
     u1 = bounds[0][1][0].view(784, 1)
-    l2 = bounds[1][0][0].view(50, 1)
-    u2 = bounds[1][1][0].view(50, 1)
+    # l2 = bounds[1][0][0].view(50, 1)
+    # u2 = bounds[1][1][0].view(50, 1)
+    # l3 = bounds[2][0][0].view(50, 1)
+    # u3 = bounds[2][1][0].view(50, 1)
+    # l4 = bounds[3][0][0].view(20, 1)
+    # u4 = bounds[3][1][0].view(20, 1)
+    # l5 = bounds[4][0][0].view(20, 1)
+    # u5 = bounds[4][1][0].view(20, 1)
+    # l6 = bounds[5][0][0].view(10, 1)
+    # u6 = bounds[5][1][0].view(10, 1)
 
-    input_domain1 = torch.cat((l1, l2), dim=0)
-    input_domain2 = torch.cat((u1, u2), dim=0)
-    input_domain = torch.cat((input_domain1, input_domain2), dim=1)
-    print(input_domain)
+    # input_domain1 = torch.cat((l1, l2, l3, l4, l5, l6), dim=0)
+    # input_domain2 = torch.cat((u1, u2, u3, u4, u5, u6), dim=0)
+    input_domain = torch.cat((l1, u1), dim=1)
+    # print(input_domain)
     for dim, (lb, ub) in enumerate(input_domain):
         v = gurobi_model.addVar(lb=lb, ub=ub, obj=0,
                               vtype=grb.GRB.CONTINUOUS,
@@ -301,56 +310,82 @@ def linear_approximation(model, bounds):
     gurobi_model.update()
     lower_bounds.append(inp_lb)
     upper_bounds.append(inp_ub)
+    new_bounds.append((inp_lb, inp_ub))
     gurobi_vars.append(inp_gurobi_vars)
-    # print("lower_bounds",lower_bounds)
-    # print("upper_bounds",upper_bounds)
+    # print("一开始的lower_bounds",lower_bounds)
+    # print("一开始的upper_bounds",upper_bounds)
     # print("gurobi_vars", gurobi_vars)
     #other layers
     layer_idx = 1
-    layers = [layer for layer in model]
-    for layer in layers:
+    # layers = [layer for layer in model]
+    for layer in model:
         new_layer_lb = []
         new_layer_ub = []
         new_layer_gurobi_vars = []
+
         if type(layer) is nn.Linear:
-            a = []
             for neuron_idx in range(layer.weight.size(0)):
                 ub = layer.bias.data[neuron_idx]
                 lb = layer.bias.data[neuron_idx]
                 lin_expr = layer.bias.data[neuron_idx]
+                ub = ub.item()
+                lb = lb.item()
+                lin_expr = lin_expr.item()
                 for prev_neuron_idx in range(layer.weight.size(1)):
+                    # print("prev_neuron_idx",prev_neuron_idx)
                     coeff = layer.weight.data[neuron_idx, prev_neuron_idx]
                     if coeff >= 0:
-                        ub += coeff * upper_bounds[-1][prev_neuron_idx]
-                        lb += coeff * lower_bounds[-1][prev_neuron_idx]
+                        # print("coeff", coeff)
+                        # print("upper_bounds[-1][", prev_neuron_idx, "]", upper_bounds[-1][prev_neuron_idx])
+                        # print("lower_bounds[-1][", prev_neuron_idx, "]", lower_bounds[-1][prev_neuron_idx])
+                        # print(ub)
+                        # print(lb)
+                        ub += coeff*upper_bounds[-1][prev_neuron_idx]
+                        # print("ub[",prev_neuron_idx,"]",ub)
+                        lb += coeff*lower_bounds[-1][prev_neuron_idx]
+                        # print("lb[",prev_neuron_idx,"]",lb)
                     else:
-                        ub += coeff * lower_bounds[-1][prev_neuron_idx]
-                        lb += coeff * upper_bounds[-1][prev_neuron_idx]
-                    lin_expr = coeff * gurobi_vars[-1][prev_neuron_idx] + lin_expr
-                    # print(lin_expr)
+                        # print("coeff", coeff)
+                        # print("upper_bounds[-1][", prev_neuron_idx, "]", upper_bounds[-1][prev_neuron_idx])
+                        # print("lower_bounds[-1][", prev_neuron_idx, "]", lower_bounds[-1][prev_neuron_idx])
+                        # print(ub)
+                        # print(lb)
+                        ub += coeff*lower_bounds[-1][prev_neuron_idx]
+                        # print("ub[-1][", prev_neuron_idx, "]", ub)
+                        lb += coeff*upper_bounds[-1][prev_neuron_idx]
+                        # print("lb[-1][", prev_neuron_idx, "]", lb)
+                    lin_expr += coeff * gurobi_vars[-1][prev_neuron_idx]
+
                 v = gurobi_model.addVar(lb=lb, ub=ub, obj=0,
                                       vtype=grb.GRB.CONTINUOUS,
                                       name=f'lay{layer_idx}_{neuron_idx}')
-                # a.append(v)
 
                 gurobi_model.addConstr(v == lin_expr)
                 # print("v",v)
                 # print("lin",lin_expr)
                 gurobi_model.update()
-                # print("这是a", a)
+
                 # print("这是v", v)
                 gurobi_model.setObjective(v, grb.GRB.MINIMIZE)
                 gurobi_model.optimize()
+                # print("gurobi_model.status", gurobi_model.status)
+                # print("3-0",v.X)
+                # if gurobi_model.status == GRB.Status.INFEASIBLE:
+                #     print('Optimization was stopped with status %d' % gurobi_model.status)
+                #     # do IIS, find infeasible constraints
+                #     gurobi_model.computeIIS()
+                #     for c in gurobi_model.getConstrs():
+                #         if c.IISConstr:
+                #             print('我是%s' % c.constrName)
 
-                print("gurobi_model.status", gurobi_model.status)
-                print(v)
-                print(v.X)
                 assert gurobi_model.status == 2, "LP wasn't optimally solved"
                 # We have computed a lower bound
                 lb = v.X
                 v.lb = lb
-
+                # print("v",v)
+                # print("lb",v.X)
                 # Let's now compute an upper bound
+
                 gurobi_model.setObjective(v, grb.GRB.MAXIMIZE)
                 gurobi_model.update()
                 gurobi_model.reset()
@@ -360,21 +395,29 @@ def linear_approximation(model, bounds):
                 assert gurobi_model.status == 2, "LP wasn't optimally solved"
                 ub = v.X
                 v.ub = ub
-                # print("lb", lb)
-                # print("ub", ub)
-                new_layer_lb.append(lb)
-                new_layer_ub.append(ub)
+                # print("ub-v",v)
+                # print("ub",v.X)
+                ub_tensor = torch.tensor(ub).clone().detach().requires_grad_(True)
+                lb_tensor = torch.tensor(lb).clone().detach().requires_grad_(True)
+                new_layer_lb.append(lb_tensor)
+                new_layer_ub.append(ub_tensor)
                 new_layer_gurobi_vars.append(v)
+
+                # print("new_lb", new_layer_lb)
+                # print("new_ub", new_layer_ub)
+                # print("new_layer_gurobi_vars", new_layer_gurobi_vars)
         elif type(layer) == nn.ReLU:
             for neuron_idx, pre_var in enumerate(gurobi_vars[-1]):
                 pre_lb = lower_bounds[-1][neuron_idx]
                 pre_ub = upper_bounds[-1][neuron_idx]
-
+                # print("我是pre_lb",pre_lb)
+                # print("我是pre_ub",pre_ub)
                 v = gurobi_model.addVar(lb=max(0, pre_lb),
                                       ub=max(0, pre_ub),
                                       obj=0,
                                       vtype=grb.GRB.CONTINUOUS,
                                       name=f'ReLU{layer_idx}_{neuron_idx}')
+
                 if pre_lb >= 0 and pre_ub >= 0:
                     # The ReLU is always passing
                     gurobi_model.addConstr(v == pre_var)
@@ -395,9 +438,15 @@ def linear_approximation(model, bounds):
                     bias = - pre_lb * slope
                     gurobi_model.addConstr(v <= slope * pre_var + bias)
 
-                new_layer_lb.append(lb)
-                new_layer_ub.append(ub)
+                ub_tensor = torch.tensor(ub).clone().detach().requires_grad_(True)
+                lb_tensor = torch.tensor(lb).clone().detach()
+                new_layer_lb.append(lb_tensor)
+                new_layer_ub.append(ub_tensor)
                 new_layer_gurobi_vars.append(v)
+
+                # print("new_lb2", new_layer_lb)
+                # print("new_ub2",new_layer_ub)
+                # print("new_layer_gurobi_vars2",new_layer_gurobi_vars)
         elif type(layer) == nn.MaxPool1d:
             assert layer.padding == 0, "Non supported Maxpool option"
             assert layer.dilation == 1, "Non supported MaxPool option"
@@ -437,32 +486,47 @@ def linear_approximation(model, bounds):
 
         lower_bounds.append(new_layer_lb)
         upper_bounds.append(new_layer_ub)
+        new_bounds.append((new_layer_lb, new_layer_ub))
         gurobi_vars.append(new_layer_gurobi_vars)
-
         layer_idx += 1
 
         # Assert that this is as expected a network with a single output
-    assert len(gurobi_vars[-1]) == 1, "Network doesn't have scalar output"
+    # assert len(gurobi_vars[-1]) == 1, "Network doesn't have scalar output"
+    # print("lb", lower_bounds)
+    # print("ub", upper_bounds)
+    # print(new_bounds)
     gurobi_model.update()
+    return new_bounds
 
 
 
 
-epsilon = 0.1
+
+epsilon = 0.5
 initial_bound = ((X[0:1] - epsilon).clamp(min=0), (X[0:1] + epsilon).clamp(max=1))
 # # 计算cnn 边界
 bounds = bound_propagation(model_small, initial_bound)
-# c = np.zeros(10)
-# c[y[0].item()] = 1
-# c[2] = -1
+new_bounds = linear_approximation(model_small, bounds)
+c = np.zeros(10)
+c[y[0].item()] = 1
+c[2] = -1
 # 使用gurobi去计算，负数说明存在对抗样本
-linear_approximation(model_small, bounds)
-# prob, (z, v) = form_milp2(model_small, c, initial_bound, bounds)
-# prob.solve(solver=cp.GUROBI, verbose=True)
+
+
+prob, (z, v) = form_milp2(model_small, c, initial_bound, new_bounds)
+prob.solve(solver=cp.GUROBI, verbose=True)
 
 
 
-
+# 找到input layer的上下界
+# l1 = bounds[0][0][0].view(784, 1)
+# u1 = bounds[0][1][0].view(784, 1)
+# l2 = bounds[1][0][0].view(50, 1)
+# u2 = bounds[1][1][0].view(50, 1)
+# input_domain1 = torch.cat((l1, l2), dim=0)
+# input_domain2 = torch.cat((u1, u2), dim=0)
+# input_domain = torch.cat((input_domain1, input_domain2), dim=1)
+#
 # for dim, (lb, ub) in enumerate(input_domain):
 #     print(dim)
 #     print(lb)
